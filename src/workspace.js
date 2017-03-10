@@ -15,6 +15,7 @@ const Panel = require('./panel')
 const PanelContainer = require('./panel-container')
 const Task = require('./task')
 const WorkspaceCenter = require('./workspace-center')
+const LocalStorageJsonTable = require('./local-storage-json-table')
 
 // Essential: Represents the state of the user interface for the entire window.
 // An instance of this class is available via the `atom.workspace` global.
@@ -45,6 +46,7 @@ module.exports = class Workspace extends Model {
     this.textEditorRegistry = params.textEditorRegistry
     this.hoveredDock = null
     this.draggingItem = false
+    this.previousLocations = new LocalStorageJsonTable('atom.preferred-locations')
 
     this.emitter = new Emitter()
     this.openers = []
@@ -137,6 +139,7 @@ module.exports = class Workspace extends Model {
     this.subscribeToActiveItem()
     this.subscribeToFontSize()
     this.subscribeToAddedItems()
+    this.subscribeToMovedItems()
   }
 
   consumeServices ({serviceHub}) {
@@ -280,6 +283,34 @@ module.exports = class Workspace extends Model {
         this.emitter.emit('did-add-text-editor', {textEditor: item, pane, index})
       }
     })
+  }
+
+  subscribeToMovedItems () {
+    if (this.movedItemSubscription != null) {
+      this.movedItemSubscription.dispose()
+    }
+    const paneContainerHosts = Object.assign({center: this}, this.docks)
+    this.movedItemSubscription = new CompositeDisposable(
+      ..._.map(paneContainerHosts, (host, location) => (
+        host.observePanes(pane => {
+          pane.onDidAddItem(({item}) => {
+            // FIXME: This actually isn't quite enough because adding a panel can change other
+            // panels' split too. I think just remembering the location is probably enough, anyway.
+            if (typeof item.getURI === 'function') {
+              this.previousLocations.setItem(
+                item.getURI(),
+                {
+                  location,
+                  // To preserve legacy behavior when reopening, we don't store splits for the
+                  // center location.
+                  split: location === 'center' ? null : getItemSplit(item, pane)
+                }
+              )
+            }
+          })
+        })
+      ))
+    )
   }
 
   // Updates the application's title and proxy icon based on whichever file is
@@ -718,13 +749,19 @@ module.exports = class Workspace extends Model {
     if (item == null) return undefined
     if (pane != null && pane.isDestroyed()) return item
 
+    const uri = options.uri == null && typeof item.getURI === 'function' ? item.getURI() : options.uri
+
     if (pane == null) {
       // If this is a new item, we want to determine where to put it in the following way:
       //   - If you provided a split, you want to put it in that split of the center location
       //     (legacy behavior)
+      //   - If the user previously placed the item, use the location they chose
       //   - If the item specifies a default location, use that.
       let locationInfo, location
       if (split == null) {
+        if (uri != null) {
+          locationInfo = this.previousLocations.getItem(uri)
+        }
         if (locationInfo == null && typeof item.getDefaultLocation === 'function') {
           locationInfo = item.getDefaultLocation()
         }
@@ -784,7 +821,6 @@ module.exports = class Workspace extends Model {
     }
 
     const index = pane.getActiveItemIndex()
-    const uri = options.uri == null && typeof item.getURI === 'function' ? item.getURI() : options.uri
     this.emitter.emit('did-open', {uri, pane, item, index})
     return item
   }
@@ -1098,6 +1134,9 @@ module.exports = class Workspace extends Model {
     this.paneContainer.destroy()
     if (this.activeItemSubscriptions != null) {
       this.activeItemSubscriptions.dispose()
+    }
+    if (this.movedItemSubscription != null) {
+      this.movedItemSubscription.dispose()
     }
   }
 
@@ -1516,4 +1555,28 @@ module.exports = class Workspace extends Model {
       return Promise.resolve(false)
     }
   }
+}
+
+function getItemSplit (item, pane) {
+  const parent = pane.getParent()
+  const orientation = parent != null && parent.orientation
+  switch (orientation) {
+    case 'horizontal':
+      const leftmost = pane.findLeftmostSibling()
+      const rightmost = pane.findRightmostSibling()
+      if (leftmost !== rightmost) {
+        if (pane === leftmost) return 'left'
+        if (pane === rightmost) return 'right'
+      }
+      break
+    case 'vertical':
+      const topmost = pane.findTopmostSibling()
+      const bottommost = pane.findBottommostSibling()
+      if (topmost !== bottommost) {
+        if (pane === topmost) return 'up'
+        if (pane === bottommost) return 'down'
+      }
+      break
+  }
+  return null
 }
